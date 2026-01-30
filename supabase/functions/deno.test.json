@@ -1,0 +1,27 @@
+{
+    "compilerOptions": {
+        "strict": true,
+        "lib": [
+            "deno.window",
+            "deno.ns"
+        ]
+    },
+    "imports": {
+        "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2",
+        "@std/assert": "https://deno.land/std@0.168.0/testing/asserts.ts",
+        "@std/testing": "https://deno.land/std@0.168.0/testing/mod.ts"
+    },
+    "tasks": {
+        "test": "deno test --allow-all --coverage=coverage",
+        "test:watch": "deno test --allow-all --watch",
+        "coverage": "deno coverage coverage --lcov --output=coverage.lcov"
+    },
+    "test": {
+        "include": [
+            "**/*.test.ts"
+        ],
+        "exclude": [
+            "coverage/**"
+        ]
+    }
+}

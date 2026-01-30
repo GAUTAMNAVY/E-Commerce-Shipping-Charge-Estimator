@@ -1,186 +1,149 @@
+/**
+ * GET /api/v1/shipping-charge
+ * Calculate shipping charge from warehouse to customer
+ * 
+ * Supports both GET and POST methods
+ * Required parameters: warehouseId, customerId
+ * Optional parameters: deliverySpeed (default: standard), productId
+ */
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { ShippingService } from "../_shared/shipping-service.ts";
+import {
+  validateUUID,
+  validateRequired,
+  validateDeliverySpeed,
+  createValidationErrorResponse
+} from "../_shared/validation.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Haversine formula to calculate distance between two points
-function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371; // Earth's radius in kilometers
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a = 
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-// Determine transport mode based on distance
-function getTransportMode(distance: number): { mode: string; rate: number } {
-  if (distance >= 500) {
-    return { mode: 'Aeroplane', rate: 1.0 };
-  } else if (distance >= 100) {
-    return { mode: 'Truck', rate: 2.0 };
-  } else {
-    return { mode: 'Mini Van', rate: 3.0 };
-  }
-}
-
 serve(async (req) => {
+  const startTime = Date.now();
+
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
 
   try {
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    // Initialize Supabase client
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
 
-    // Parse request
+    if (!supabaseUrl || !supabaseKey) {
+      throw new Error('Missing Supabase configuration');
+    }
+
+    const supabase = createClient(supabaseUrl, supabaseKey);
+    const shippingService = new ShippingService(supabase);
+
+    // Parse request parameters (support both GET and POST)
     let warehouseId: string | null = null;
     let customerId: string | null = null;
-    let deliverySpeed: string | null = null;
+    let deliverySpeed: string = 'standard';
     let productId: string | null = null;
 
     if (req.method === 'POST') {
-      const body = await req.json();
-      warehouseId = body.warehouseId;
-      customerId = body.customerId;
-      deliverySpeed = body.deliverySpeed || 'standard';
-      productId = body.productId;
-    } else {
+      try {
+        const body = await req.json();
+        warehouseId = body.warehouseId;
+        customerId = body.customerId;
+        deliverySpeed = body.deliverySpeed || 'standard';
+        productId = body.productId;
+      } catch {
+        return new Response(
+          JSON.stringify({
+            error: 'Invalid JSON in request body',
+            hint: 'Ensure your request body is valid JSON'
+          }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    } else if (req.method === 'GET') {
       const url = new URL(req.url);
       warehouseId = url.searchParams.get('warehouseId');
       customerId = url.searchParams.get('customerId');
       deliverySpeed = url.searchParams.get('deliverySpeed') || 'standard';
       productId = url.searchParams.get('productId');
+    } else {
+      return new Response(
+        JSON.stringify({
+          error: 'Method not allowed',
+          hint: 'This endpoint supports GET and POST methods',
+          allowedMethods: ['GET', 'POST']
+        }),
+        { status: 405, headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Allow': 'GET, POST' } }
+      );
     }
 
     // Validate required parameters
-    if (!warehouseId || !customerId) {
+    try {
+      validateRequired({ warehouseId, customerId });
+      if (warehouseId) validateUUID(warehouseId, 'warehouseId');
+      if (customerId) validateUUID(customerId, 'customerId');
+      if (productId) validateUUID(productId, 'productId');
+      validateDeliverySpeed(deliverySpeed);
+    } catch (error) {
+      const validationError = createValidationErrorResponse(error);
       return new Response(
-        JSON.stringify({ error: 'warehouseId and customerId are required' }),
+        JSON.stringify({
+          ...validationError,
+          hint: 'Provide valid warehouseId, customerId, and deliverySpeed (standard or express)'
+        }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Validate delivery speed
-    if (deliverySpeed !== 'standard' && deliverySpeed !== 'express') {
-      return new Response(
-        JSON.stringify({ error: 'deliverySpeed must be "standard" or "express"' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Fetch warehouse
-    const { data: warehouse, error: warehouseError } = await supabase
-      .from('warehouses')
-      .select('id, name, latitude, longitude')
-      .eq('id', warehouseId)
-      .single();
-
-    if (warehouseError || !warehouse) {
-      console.error('Warehouse not found:', warehouseError);
-      return new Response(
-        JSON.stringify({ error: 'Warehouse not found' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Fetch customer
-    const { data: customer, error: customerError } = await supabase
-      .from('customers')
-      .select('id, name, latitude, longitude')
-      .eq('id', customerId)
-      .single();
-
-    if (customerError || !customer) {
-      console.error('Customer not found:', customerError);
-      return new Response(
-        JSON.stringify({ error: 'Customer not found' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Fetch delivery speed config
-    const { data: deliveryConfig, error: deliveryError } = await supabase
-      .from('delivery_speeds')
-      .select('*')
-      .eq('speed_type', deliverySpeed)
-      .single();
-
-    if (deliveryError || !deliveryConfig) {
-      console.error('Delivery speed config not found:', deliveryError);
-      return new Response(
-        JSON.stringify({ error: 'Delivery speed configuration not found' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Calculate distance
-    const distance = calculateDistance(
-      warehouse.latitude,
-      warehouse.longitude,
-      customer.latitude,
-      customer.longitude
+    // Calculate shipping charge using service layer
+    const result = await shippingService.calculateShippingCharge(
+      warehouseId!,
+      customerId!,
+      deliverySpeed,
+      productId || undefined
     );
 
-    // Get transport mode and rate
-    const { mode, rate } = getTransportMode(distance);
-
-    // Get product weight if provided, default to 1kg
-    let weightKg = 1;
-    if (productId) {
-      const { data: product } = await supabase
-        .from('products')
-        .select('weight_kg')
-        .eq('id', productId)
-        .single();
-      
-      if (product) {
-        weightKg = product.weight_kg;
-      }
-    }
-
-    // Calculate charges
-    const baseCharge = Number(deliveryConfig.base_charge);
-    const transportCharge = distance * rate * weightKg;
-    const expressCharge = deliverySpeed === 'express' 
-      ? Number(deliveryConfig.extra_charge_per_kg) * weightKg 
-      : 0;
-    
-    const totalCharge = baseCharge + transportCharge + expressCharge;
-
-    console.log(`Shipping charge calculated: ${totalCharge.toFixed(2)} Rs (${mode}, ${distance.toFixed(2)} km, ${weightKg} kg)`);
-
-    const response = {
-      shippingCharge: Math.round(totalCharge * 100) / 100,
-      transportMode: mode,
-      distance_km: Math.round(distance * 100) / 100,
-      weight_kg: weightKg,
-      breakdown: {
-        baseCharge: baseCharge,
-        transportCharge: Math.round(transportCharge * 100) / 100,
-        expressCharge: Math.round(expressCharge * 100) / 100
-      }
-    };
+    const responseTime = Date.now() - startTime;
+    console.log(`✓ Shipping charge calculated: ₹${result.shippingCharge} (${result.transportMode}, ${result.distance_km}km) - ${responseTime}ms`);
 
     return new Response(
-      JSON.stringify(response),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      JSON.stringify(result),
+      {
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+          'X-Response-Time': `${responseTime}ms`
+        }
+      }
     );
 
   } catch (error) {
-    console.error('Error in shipping-charge function:', error);
+    const responseTime = Date.now() - startTime;
+    console.error('✗ Error in shipping-charge function:', error);
+
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    const statusCode = errorMessage.includes('not found') ? 404 : 500;
+
     return new Response(
-      JSON.stringify({ error: 'Internal server error', details: errorMessage }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      JSON.stringify({
+        error: statusCode === 404 ? 'Resource not found' : 'Internal server error',
+        message: errorMessage,
+        hint: statusCode === 404
+          ? 'Verify that the warehouseId and customerId exist in the database'
+          : 'Please try again later or contact support if the issue persists'
+      }),
+      {
+        status: statusCode,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+          'X-Response-Time': `${responseTime}ms`
+        }
+      }
     );
   }
 });
